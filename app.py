@@ -43,7 +43,7 @@ def assign_box_colors(df_box):
 
 
 # ------------------------------------------------------------------------------
-# 3. CORE DBL ALGORITHM (WITH SORTING & LBSz DENSITY/PRESSURE CHECKS)
+# 3. CORE DBL ALGORITHM (WITH SORTING & PRESSURE GATING)
 # ------------------------------------------------------------------------------
 class EmptySpace:
 
@@ -63,10 +63,8 @@ class EmptySpace:
     self.width = x2 - x1
     self.length = y2 - y1
     self.height = z2 - z1
-    self.lbs_z = lbs_z_limit  # Max weight capacity supported on this space
-    self.base_lbs_density = (
-        base_lbs_density  # Max LBSz per sq. cm of base box footprint
-    )
+    self.lbs_z = lbs_z_limit
+    self.base_lbs_density = base_lbs_density  # Max LBSz per sq. cm
 
 
 def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
@@ -75,7 +73,7 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
   ch = container_info["Height_cm"]
   max_c_weight = container_info.get("Max_Weight_kg", 28000)
 
-  # Initial space (Ground floor has infinite surface pressure density limit)
+  # Initial ground floor space
   space_list = [
       EmptySpace(
           0,
@@ -97,10 +95,7 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
       item["info"]["Box_ID"]: item["info"] for item in user_box_orders
   }
 
-  # --------------------------------------------------------------------------
-  # REQUIRED ENHANCEMENT 1: PRE-SORT BOX ORDERS
-  # Priority: 1. Box Volume (Big to Small), 2. Box LBSz (More to Less)
-  # --------------------------------------------------------------------------
+  # 1. PRE-SORTING: Descending Volume, then Descending LBSz
   def get_box_sort_key(item):
     b = item["info"]
     vol = (
@@ -115,13 +110,12 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
       lbs_z = 0
     return (vol, lbs_z)
 
-  # Sort orders in descending order (Big volume first, higher LBSz first)
   sorted_user_orders = sorted(
       user_box_orders, key=get_box_sort_key, reverse=True
   )
 
   while space_list and any(qty > 0 for qty in boxes_in_stock.values()):
-    # Select space (Min X1 -> Min Z1 -> Min Y1)
+    # Select Space: Min X1 -> Min Z1 -> Min Y1
     space_list.sort(key=lambda s: (s.x1, s.z1, s.y1))
     space = space_list.pop(0)
 
@@ -138,7 +132,6 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
       box = box_info_dict[box_id]
       unit_weight = float(box.get("Weight_kg", 0))
 
-      # Extract LBS_z from box master data
       raw_lbs = box.get("LBS_z", box.get("lbs_z", float("inf")))
       try:
         lbs_z_total = (
@@ -188,19 +181,16 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
         if max_x_fit == 0 or max_y_fit == 0 or max_z_fit == 0:
           continue
 
-        # Check total block space weight capacity
+        # Nominal Total Weight Check
         if unit_weight > 0 and unit_weight > space.lbs_z:
           continue
 
-        # ------------------------------------------------------------------
-        # REQUIRED ENHANCEMENT 2: LBSz vs WEIGHT DENSITY CHECK (kg/cm^2)
-        # ------------------------------------------------------------------
+        # 2. PRESSURE GATING CHECK (kg/cm^2)
         box_footprint_area = bw * bl
         if box_footprint_area > 0 and unit_weight > 0:
           upper_weight_density = unit_weight / box_footprint_area
-          # Reject if weight per sq cm of upper box exceeds supporting capacity density of lower box
           if upper_weight_density > space.base_lbs_density:
-            continue
+            continue  # Non-destructive: Skip to next loop iteration
 
         eje_x = min(max_x_fit, qty_left)
         if eje_x == 0:
@@ -274,6 +264,7 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
                 "Length_cm": bp["bl"],
                 "Height_cm": bp["bh"],
                 "weight_kg": b_info.get("Weight_kg", 0),
+                "lbs_z": b_info.get("LBS_z", "N/A"),
                 "color": box_color,
                 "label": f"{b_info['Box_Name']} | {b_info['Customer_Name']}",
             })
@@ -310,13 +301,11 @@ def run_dbl_algorithm(container_info, user_box_orders, box_colors_map):
             )
         )
 
-      # Space C: Upper space (Calculate base box footprint LBSz density kg/cm^2)
+      # Space C: Upper
       if space.z1 + block_h < space.z2:
         upper_space_lbs = min(
             space.lbs_z - (bp["unit_weight"] * bp["eje_z"]), bp["lbs_z_total"]
         )
-
-        # Base box density limit: LBSz / (bw * bl)
         base_footprint_area = bp["bw"] * bp["bl"]
         current_base_density = (
             (bp["lbs_z_total"] / base_footprint_area)
@@ -402,15 +391,32 @@ def calculate_ldd(placed_boxes, container_info):
 
 
 # ------------------------------------------------------------------------------
-# 5. PLOTLY 3D RENDER ENGINE
+# 5. PLOTLY 3D RENDER ENGINE (ENHANCED HOVER TOOLTIP)
 # ------------------------------------------------------------------------------
-def create_3d_cube_mesh(x1, y1, z1, x2, y2, z2, color, name_tag):
+def create_3d_cube_mesh(
+    x1, y1, z1, x2, y2, z2, color, name_tag, box_details
+):
   x = [x1, x2, x2, x1, x1, x2, x2, x1]
   y = [y1, y1, y2, y2, y1, y1, y2, y2]
   z = [z1, z1, z1, z1, z2, z2, z2, z2]
   i = [7, 0, 0, 0, 4, 4, 6, 6, 4, 0, 3, 2]
   j = [3, 4, 1, 2, 5, 6, 5, 2, 0, 1, 6, 3]
   k = [0, 7, 5, 3, 6, 7, 1, 1, 5, 5, 7, 6]
+
+  # Detailed formatted hover text
+  hover_text = (
+      f"<b>{box_details['Box_Name']}</b><br>"
+      f"<b>Customer:</b> {box_details['Customer_Name']}<br>"
+      f"------------------------------<br>"
+      f"<b>Coord X:</b> {x1:.0f} to {x2:.0f} cm<br>"
+      f"<b>Coord Y:</b> {y1:.0f} to {y2:.0f} cm<br>"
+      f"<b>Coord Z:</b> {z1:.0f} to {z2:.0f} cm<br>"
+      f"------------------------------<br>"
+      f"<b>Dimensions:</b> {x2-x1:.0f} x {y2-y1:.0f} x {z2-z1:.0f} cm<br>"
+      f"<b>Weight:</b> {box_details['weight_kg']:.1f} kg<br>"
+      f"<b>LBSz:</b> {box_details.get('lbs_z', 'N/A')}<br>"
+      f"<extra></extra>"
+  )
 
   return go.Mesh3d(
       x=x,
@@ -422,8 +428,9 @@ def create_3d_cube_mesh(x1, y1, z1, x2, y2, z2, color, name_tag):
       color=color,
       opacity=0.85,
       name=name_tag,
+      hovertext=hover_text,
+      hoverinfo="text",
       showscale=False,
-      hoverinfo="name",
   )
 
 
@@ -456,6 +463,7 @@ def plot_interactive_container(container, placed_boxes, cg_x, cg_y):
         b["z2"],
         color=b["color"],
         name_tag=b["label"],
+        box_details=b,
     )
     fig.add_trace(mesh)
 
@@ -480,6 +488,9 @@ def plot_interactive_container(container, placed_boxes, cg_x, cg_y):
       ),
       margin=dict(r=0, l=0, b=0, t=10),
       height=650,
+      hoverlabel=dict(
+          bgcolor="white", font_size=13, font_family="Arial"
+      ),  # High readability tooltip styling
   )
   return fig
 
@@ -551,7 +562,7 @@ def load_master_data():
         },
         {
             "Box_ID": "BOX-D",
-            "Box_Name": "Pallet C (spare)",
+            "Box_Name": "Pallet D (Component)",
             "Customer_Name": "Toyota",
             "Width_cm": 90,
             "Length_cm": 115,
@@ -602,7 +613,7 @@ st.sidebar.subheader("Specify Box Quantities")
 user_box_orders = []
 for _, box in df_box.iterrows():
   label = f"{box['Box_Name']} [{box['Customer_Name']}]"
-  qty = st.sidebar.number_input(label, min_value=0, value=20, step=1)
+  qty = st.sidebar.number_input(label, min_value=0, value=10, step=1)
   if qty > 0:
     user_box_orders.append({"info": box, "qty": qty})
 
@@ -645,45 +656,52 @@ with tab_user:
   m3.metric("🎯 CG Point (X, Y)", f"{cg_x:.0f}, {cg_y:.0f} cm")
   m4.metric("🚛 LDD Status", "✅ Safe" if ldd_pass else "⚠️ Overload")
 
-  st.markdown("### 🚛 Load Distribution Diagram (Axle Weights)")
-  ldd_col1, ldd_col2 = st.columns(2)
-  with ldd_col1:
-    if f_axle <= f_limit:
-      st.success(
-          f"**Front Axle:** {f_axle:,.1f} kg / Limit {f_limit:,.0f} kg — Passed"
-      )
-    else:
-      st.error(
-          f"**Front Axle:** {f_axle:,.1f} kg / Limit {f_limit:,.0f} kg — ⚠️"
-          " Overloaded!"
-      )
-  with ldd_col2:
-    if r_axle <= r_limit:
-      st.success(
-          f"**Rear Axle:** {r_axle:,.1f} kg / Limit {r_limit:,.0f} kg — Passed"
-      )
-    else:
-      st.error(
-          f"**Rear Axle:** {r_axle:,.1f} kg / Limit {r_limit:,.0f} kg — ⚠️"
-          " Overloaded!"
-      )
-
   st.markdown("---")
 
-  col_graph, col_legend = st.columns([4, 1])
+  col_graph, col_legend = st.columns([3.8, 1.2])
   with col_graph:
     fig = plot_interactive_container(container_info, placed_boxes, cg_x, cg_y)
     st.plotly_chart(fig, use_container_width=True)
 
   with col_legend:
-    st.subheader("🎨 Color Legend")
+    st.subheader("🎨 Color Legend & Summary")
+
+    # Count loaded boxes per type
+    loaded_counts = {}
+    for b in placed_boxes:
+      b_id = b["Box_ID"]
+      loaded_counts[b_id] = loaded_counts.get(b_id, 0) + 1
+
     for item in user_box_orders:
       box = item["info"]
-      color = box_colors_map.get(box["Box_ID"], "#FF5733")
+      b_id = box["Box_ID"]
+      requested_qty = item["qty"]
+      loaded_qty = loaded_counts.get(b_id, 0)
+      color = box_colors_map.get(b_id, "#FF5733")
+
+      badge_bg = (
+          "#2ECC71"
+          if loaded_qty == requested_qty
+          else ("#E67E22" if loaded_qty > 0 else "#E74C3C")
+      )
+
       st.markdown(
-          '<div style="display: flex; align-items: center; margin-bottom:'
-          f' 8px;"><div style="width: 20px; height: 20px; background-color:'
-          f' {color}; border-radius: 4px; margin-right: 10px;"></div><span><b>{box["Box_Name"]}</b><br><small>{box["Customer_Name"]}</small></span></div>',
+          f"""
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; padding: 8px; border-radius: 6px; background-color: #F8F9FA; border: 1px solid #E9ECEF;">
+                <div style="display: flex; align-items: center;">
+                    <div style="width: 18px; height: 18px; background-color: {color}; border-radius: 4px; margin-right: 10px;"></div>
+                    <div>
+                        <span style="font-size: 13px; font-weight: 600; color: #212529;">{box['Box_Name']}</span><br>
+                        <small style="color: #6C757D;">{box['Customer_Name']}</small>
+                    </div>
+                </div>
+                <div>
+                    <span style="background-color: {badge_bg}; color: white; padding: 3px 8px; border-radius: 12px; font-weight: bold; font-size: 12px;">
+                        {loaded_qty}/{requested_qty}
+                    </span>
+                </div>
+            </div>
+            """,
           unsafe_allow_html=True,
       )
 
@@ -726,6 +744,7 @@ with tab_reports:
         "Length_cm",
         "Height_cm",
         "weight_kg",
+        "lbs_z",
     ]
     df_placed_display = df_placed[display_cols]
 
